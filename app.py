@@ -585,5 +585,4 @@ if uploaded is None:
     st.info("ارفع ملف Excel يحتوي الأعمدة: Meter Number, Meter Datetime, Office, V1..V3, A1..A3")
 
     st.markdown("---")
-    st.markdown("👨‍💻 Developed by: Mashhour Alabbas | 2026")
-    st.stop()
+st.markdown("👨‍💻 Developed by: Mashhour Alabbas | 2026")
