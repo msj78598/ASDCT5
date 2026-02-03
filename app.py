@@ -491,7 +491,6 @@ def build_excel_bytes(cases: pd.DataFrame, meters: pd.DataFrame, rows_top: pd.Da
 st.set_page_config(page_title="NTL Detector - CT Meters", layout="wide")
 
 st.title("NTL Detector – شاشة تشغيل كشف الفاقد المحتمل (عدادات CT)")
-st.caption("رفع ملف Excel → تحليل سريع → جدول حالات شامل + تصدير Excel. (بدون رسومات لتخفيف الحمل)")
 
 # Sidebar settings
 st.sidebar.header("إعدادات التشغيل")
@@ -581,3 +580,5 @@ st.download_button(
 )
 
 st.caption("Sheets داخل ملف Excel: Cases (الحالات) + Meters (ترتيب العدادات) + TopRows (أعلى قراءات خطورة - مختصرة).")
+
+st.markdown("👨‍💻 **تطوير :** مشهور العباس | 00966553339838 | ")
