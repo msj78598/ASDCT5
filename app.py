@@ -9,22 +9,25 @@ import joblib
 # CONFIG
 # =========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# =========================
-# Template download
-# =========================
+
 TEMPLATE_PATH = os.path.join(BASE_DIR, "Data Template.xlsx")
 
-def get_template_bytes() -> bytes:
-    if os.path.exists(TEMPLATE_PATH):
-        with open(TEMPLATE_PATH, "rb") as f:
-            return f.read()
-    return b""
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 POINT_DIR  = os.path.join(MODELS_DIR, "point_models")
 DIST_DIR   = os.path.join(MODELS_DIR, "distribution_models")
 TEMP_DIR   = os.path.join(MODELS_DIR, "temporal_models")
 
 MIN_POINTS_FOR_TEMPORAL = 8
+
+
+# =========================
+# Template download
+# =========================
+def get_template_bytes() -> bytes:
+    if os.path.exists(TEMPLATE_PATH):
+        with open(TEMPLATE_PATH, "rb") as f:
+            return f.read()
+    return b""
 
 
 # =========================
@@ -193,7 +196,7 @@ def compute_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# Explainability (lightweight)
+# Explainability (compact)
 # =========================
 def reason_from_features(pf_row: pd.Series) -> str:
     reasons = []
@@ -222,12 +225,12 @@ def confidence_label(agreement: float, duration_points: int) -> str:
 
 
 # =========================
-# Period extraction (no plots)
+# Period extraction
 # =========================
 def extract_period_cases(g: pd.DataFrame, meter_thr: float, min_points: int = 2):
     """
     Extract contiguous segments where final_score >= meter_thr.
-    Returns list of dicts (cases).
+    Returns list of df segments.
     """
     g = g.sort_values("Meter Datetime").copy()
     high = g["final_score"] >= meter_thr
@@ -271,14 +274,15 @@ def load_models():
 
 
 # =========================
-# Inference
+# Inference (no Top% – no neglect)
 # =========================
 @st.cache_data(show_spinner=False)
 def run_inference(file_bytes: bytes,
-                  top_percent: float,
+                  min_case_risk: float,
                   meter_quantile_for_periods: float,
                   min_period_points: int,
-                  compute_periods: bool):
+                  compute_periods: bool,
+                  max_rows_export: int = 5000):
     df = pd.read_excel(io.BytesIO(file_bytes))
 
     # Validate
@@ -327,7 +331,13 @@ def run_inference(file_bytes: bytes,
     df["n_p_if"] = normalize_to_0_100(df["score_point_iforest"])
     df["n_p_mcd"] = normalize_to_0_100(df["score_point_mcd"])
     df["n_d_if"] = normalize_to_0_100(df["score_dist_iforest"])
-    df["n_t_if"] = normalize_to_0_100(df["score_temp_iforest"].fillna(df["score_temp_iforest"].median()))
+    # if temp missing, fill by median for scaling only
+    temp_fill = df["score_temp_iforest"].copy()
+    if temp_fill.notna().any():
+        temp_fill = temp_fill.fillna(temp_fill.median())
+    else:
+        temp_fill = temp_fill.fillna(0.0)
+    df["n_t_if"] = normalize_to_0_100(temp_fill)
 
     # Dynamic weights
     has_temp = df["score_temp_iforest"].notna().astype(float)
@@ -345,7 +355,7 @@ def run_inference(file_bytes: bytes,
         w_temp_eff * df["n_t_if"]
     )
 
-    # Meter summary
+    # Meter summary (ALL meters)
     meters = df.groupby("Meter Number", as_index=False).agg(
         Office=("Office","first"),
         n_points=("Meter Datetime","count"),
@@ -353,27 +363,22 @@ def run_inference(file_bytes: bytes,
         end_time=("Meter Datetime","max"),
         risk_max=("final_score","max"),
         risk_mean=("final_score","mean"),
+        # better engineering: use mean across phases
         A_mean=("A1","mean"),
         V_mean=("V1","mean"),
-    ).sort_values("risk_max", ascending=False)
+    )
+    # keep original columns but add better phase-avg too
+    meters["A_mean_3ph"] = df.groupby("Meter Number")[["A1","A2","A3"]].mean().mean(axis=1).values
+    meters["V_mean_3ph"] = df.groupby("Meter Number")[["V1","V2","V3"]].mean().mean(axis=1).values
 
-    # Choose global threshold by top_percent
-    # e.g. top 1% meters
-    k = max(1, int(np.ceil((top_percent / 100.0) * len(meters))))
-    top_meters = meters.head(k).copy()
-    top_set = set(top_meters["Meter Number"].astype(str).tolist())
+    # Work df for cases: ALL (no neglect)
+    df_top = df.copy()
 
-    # Build a lightweight "cases table"
-    # case = (meter + period/instant) + reason + confidence + suggested visit time
-    cases_rows = []
-
-    # Prepare pf merged for reasons (only for top meters to keep it light)
-    df_top = df[df["Meter Number"].astype(str).isin(top_set)].copy()
+    # Attach point-features (needed for electrical snapshot & reason)
     pf_top = compute_point_features(df_top).add_prefix("pf_")
     df_top = df_top.join(pf_top)
 
     # agreement proxy: how many model components are "high"
-    # (use normalized components)
     df_top["agree_count"] = (
         (df_top["n_p_if"] >= 80).astype(int) +
         (df_top["n_d_if"] >= 80).astype(int) +
@@ -381,100 +386,197 @@ def run_inference(file_bytes: bytes,
     )
     df_top["agreement"] = df_top["agree_count"] / 3.0
 
+    # Build cases for ALL meters (then filter by min_case_risk)
+    cases_rows = []
+
     if compute_periods:
-        # per meter: threshold based on meter's own score quantile
         for meter, g in df_top.groupby("Meter Number", sort=False):
             g = g.sort_values("Meter Datetime")
-            thr = g["final_score"].quantile(meter_quantile_for_periods)
 
+            # threshold internal to meter to define "periods"
+            thr = g["final_score"].quantile(meter_quantile_for_periods)
             segs = extract_period_cases(g, meter_thr=thr, min_points=min_period_points)
 
             if not segs:
                 # fallback: single highest timestamp
                 top_row = g.sort_values("final_score", ascending=False).iloc[0]
-                reason = reason_from_features(top_row.filter(like="pf_").rename(lambda x: x.replace("pf_", "")))
-                conf = confidence_label(float(top_row["agreement"]), 1)
+                pf_row = top_row.filter(like="pf_").rename(lambda x: x.replace("pf_", ""))
+
+                A_mean_inst = float((top_row["A1"] + top_row["A2"] + top_row["A3"]) / 3.0)
+                V_mean_inst = float((top_row["V1"] + top_row["V2"] + top_row["V3"]) / 3.0)
+
                 cases_rows.append({
                     "case_type": "Instant",
                     "Meter Number": meter,
                     "Office": top_row["Office"],
                     "risk_%": round(float(top_row["final_score"]), 2),
-                    "confidence": conf,
-                    "reason": reason,
+                    "confidence": confidence_label(float(top_row["agreement"]), 1),
+                    "reason": reason_from_features(pf_row),
+
                     "start_time": top_row["Meter Datetime"],
                     "end_time": top_row["Meter Datetime"],
                     "duration_min": 0,
                     "points": 1,
                     "suggested_visit_time": top_row["Meter Datetime"],
-                    "A_mean_case": round(float((top_row["A1"]+top_row["A2"]+top_row["A3"])/3.0), 3),
-                    "S_proxy_case": round(float(top_row["pf_S_proxy"]), 3),
+
+                    # Electrical numeric snapshot (instant)
+                    "V1": round(float(top_row["V1"]), 3),
+                    "V2": round(float(top_row["V2"]), 3),
+                    "V3": round(float(top_row["V3"]), 3),
+                    "A1": round(float(top_row["A1"]), 3),
+                    "A2": round(float(top_row["A2"]), 3),
+                    "A3": round(float(top_row["A3"]), 3),
+                    "V_mean": round(V_mean_inst, 3),
+                    "A_mean": round(A_mean_inst, 3),
+                    "V_imb_%": round(float(pf_row.get("V_imb", 0) * 100.0), 2),
+                    "A_imb_%": round(float(pf_row.get("A_imb", 0) * 100.0), 2),
+                    "Amax_Amin_ratio": round(float(pf_row.get("A_phase_ratio_max_min", 0)), 2),
+                    "S_proxy": round(float(pf_row.get("S_proxy", 0)), 3),
+
+                    # transparency per-path (optional but useful)
+                    "risk_point_%": round(float(0.7*top_row["n_p_if"] + 0.3*top_row["n_p_mcd"]), 2),
+                    "risk_dist_%": round(float(top_row["n_d_if"]), 2),
+                    "risk_temp_%": round(float(top_row["n_t_if"]), 2),
                 })
                 continue
 
             for seg in segs:
-                # pick peak row for reason and suggested visit time
                 seg = seg.copy()
                 peak = seg.sort_values("final_score", ascending=False).iloc[0]
-
-                reason = reason_from_features(peak.filter(like="pf_").rename(lambda x: x.replace("pf_", "")))
-                conf = confidence_label(float(peak["agreement"]), len(seg))
+                pf_row = peak.filter(like="pf_").rename(lambda x: x.replace("pf_", ""))
 
                 start = seg["Meter Datetime"].iloc[0]
                 end   = seg["Meter Datetime"].iloc[-1]
                 duration_min = int((end - start).total_seconds() / 60) if pd.notna(start) and pd.notna(end) else 0
+
+                # Load snapshot across the period (numeric only)
+                A_seg = seg[["A1","A2","A3"]].astype(float)
+                V_seg = seg[["V1","V2","V3"]].astype(float)
+                A_mean_series = A_seg.mean(axis=1)
+                V_mean_series = V_seg.mean(axis=1)
+
+                peak_A_mean = float(A_mean_series.max())
+                avg_A_mean  = float(A_mean_series.mean())
+                peak_V_mean = float(V_mean_series.max())
+                avg_V_mean  = float(V_mean_series.mean())
+
+                # Peak-phase values at peak time
+                peak_A1, peak_A2, peak_A3 = float(peak["A1"]), float(peak["A2"]), float(peak["A3"])
+                peak_V1, peak_V2, peak_V3 = float(peak["V1"]), float(peak["V2"]), float(peak["V3"])
+
+                peak_S_proxy = float(seg["pf_S_proxy"].max())
+                avg_S_proxy  = float(seg["pf_S_proxy"].mean())
 
                 cases_rows.append({
                     "case_type": "Period",
                     "Meter Number": meter,
                     "Office": peak["Office"],
                     "risk_%": round(float(peak["final_score"]), 2),
-                    "confidence": conf,
-                    "reason": reason,
+                    "confidence": confidence_label(float(peak["agreement"]), int(len(seg))),
+                    "reason": reason_from_features(pf_row),
+
                     "start_time": start,
                     "end_time": end,
                     "duration_min": duration_min,
                     "points": int(len(seg)),
                     "suggested_visit_time": peak["Meter Datetime"],
-                    "A_mean_case": round(float(seg[["A1","A2","A3"]].mean(axis=1).mean()), 3),
-                    "S_proxy_case": round(float(seg["pf_S_proxy"].mean()), 3),
+
+                    # Electrical numeric summary (period)
+                    "V1_peak": round(peak_V1, 3),
+                    "V2_peak": round(peak_V2, 3),
+                    "V3_peak": round(peak_V3, 3),
+                    "A1_peak": round(peak_A1, 3),
+                    "A2_peak": round(peak_A2, 3),
+                    "A3_peak": round(peak_A3, 3),
+
+                    "V_mean_avg": round(avg_V_mean, 3),
+                    "V_mean_peak": round(peak_V_mean, 3),
+                    "A_mean_avg": round(avg_A_mean, 3),
+                    "A_mean_peak": round(peak_A_mean, 3),
+
+                    "V_imb_%": round(float(pf_row.get("V_imb", 0) * 100.0), 2),
+                    "A_imb_%": round(float(pf_row.get("A_imb", 0) * 100.0), 2),
+                    "Amax_Amin_ratio": round(float(pf_row.get("A_phase_ratio_max_min", 0)), 2),
+
+                    "S_proxy_avg": round(avg_S_proxy, 3),
+                    "S_proxy_peak": round(peak_S_proxy, 3),
+
+                    # transparency per-path (optional but useful)
+                    "risk_point_%": round(float(0.7*peak["n_p_if"] + 0.3*peak["n_p_mcd"]), 2),
+                    "risk_dist_%": round(float(peak["n_d_if"]), 2),
+                    "risk_temp_%": round(float(peak["n_t_if"]), 2),
                 })
     else:
-        # instant-only cases (fastest)
+        # instant-only for ALL meters
         for meter, g in df_top.groupby("Meter Number", sort=False):
             peak = g.sort_values("final_score", ascending=False).iloc[0]
-            reason = reason_from_features(peak.filter(like="pf_").rename(lambda x: x.replace("pf_", "")))
-            conf = confidence_label(float(peak["agreement"]), 1)
+            pf_row = peak.filter(like="pf_").rename(lambda x: x.replace("pf_", ""))
+
+            A_mean_inst = float((peak["A1"] + peak["A2"] + peak["A3"]) / 3.0)
+            V_mean_inst = float((peak["V1"] + peak["V2"] + peak["V3"]) / 3.0)
+
             cases_rows.append({
                 "case_type": "Instant",
                 "Meter Number": meter,
                 "Office": peak["Office"],
                 "risk_%": round(float(peak["final_score"]), 2),
-                "confidence": conf,
-                "reason": reason,
+                "confidence": confidence_label(float(peak["agreement"]), 1),
+                "reason": reason_from_features(pf_row),
+
                 "start_time": peak["Meter Datetime"],
                 "end_time": peak["Meter Datetime"],
                 "duration_min": 0,
                 "points": 1,
                 "suggested_visit_time": peak["Meter Datetime"],
-                "A_mean_case": round(float((peak["A1"]+peak["A2"]+peak["A3"])/3.0), 3),
-                "S_proxy_case": round(float(peak["pf_S_proxy"]), 3),
+
+                # Electrical numeric snapshot (instant)
+                "V1": round(float(peak["V1"]), 3),
+                "V2": round(float(peak["V2"]), 3),
+                "V3": round(float(peak["V3"]), 3),
+                "A1": round(float(peak["A1"]), 3),
+                "A2": round(float(peak["A2"]), 3),
+                "A3": round(float(peak["A3"]), 3),
+                "V_mean": round(V_mean_inst, 3),
+                "A_mean": round(A_mean_inst, 3),
+                "V_imb_%": round(float(pf_row.get("V_imb", 0) * 100.0), 2),
+                "A_imb_%": round(float(pf_row.get("A_imb", 0) * 100.0), 2),
+                "Amax_Amin_ratio": round(float(pf_row.get("A_phase_ratio_max_min", 0)), 2),
+                "S_proxy": round(float(pf_row.get("S_proxy", 0)), 3),
+
+                "risk_point_%": round(float(0.7*peak["n_p_if"] + 0.3*peak["n_p_mcd"]), 2),
+                "risk_dist_%": round(float(peak["n_d_if"]), 2),
+                "risk_temp_%": round(float(peak["n_t_if"]), 2),
             })
 
     cases = pd.DataFrame(cases_rows)
-    if len(cases) > 0:
-        cases = cases.sort_values(["risk_%", "confidence"], ascending=[False, True])
 
-    # For large data: keep a small rows table (top risky timestamps only)
-    # (So excel export isn't huge)
-    df_top_rows_export = df_top.sort_values("final_score", ascending=False).head(5000)[
-        ["Meter Number","Office","Meter Datetime","final_score","V1","V2","V3","A1","A2","A3"]
+    # Keep ONLY anomalous cases (no "healthy")
+    if len(cases) > 0:
+        cases = cases[cases["risk_%"] >= float(min_case_risk)].copy()
+
+        # de-dup exact same period in same meter (keep strongest risk)
+        if compute_periods and {"Meter Number","start_time","end_time"}.issubset(cases.columns):
+            cases = cases.sort_values(["Meter Number","start_time","end_time","risk_%"], ascending=[True, True, True, False])
+            cases = cases.drop_duplicates(subset=["Meter Number","start_time","end_time"], keep="first")
+
+        # required order: from low to high risk (user can sort in UI anyway)
+        cases = cases.sort_values(["risk_%", "confidence"], ascending=[True, True]).reset_index(drop=True)
+
+    # Helpful: show a "Meters Explorer" dataset too
+    meters = meters.sort_values("risk_max", ascending=False).reset_index(drop=True)
+
+    # Export rows: keep top risky rows among anomalous (for audit)
+    df_export_rows = df_top[df_top["final_score"] >= float(min_case_risk)].copy()
+    df_export_rows = df_export_rows.sort_values("final_score", ascending=False).head(max_rows_export)[
+        ["Meter Number","Office","Meter Datetime","final_score","V1","V2","V3","A1","A2","A3",
+         "n_p_if","n_p_mcd","n_d_if","n_t_if"]
     ].copy()
 
-    return df, meters, cases, df_top_rows_export
+    return df, meters, cases, df_export_rows
 
 
 # =========================
-# Excel export (single click)
+# Excel export
 # =========================
 def build_excel_bytes(cases: pd.DataFrame, meters: pd.DataFrame, rows_top: pd.DataFrame) -> bytes:
     output = io.BytesIO()
@@ -486,22 +588,21 @@ def build_excel_bytes(cases: pd.DataFrame, meters: pd.DataFrame, rows_top: pd.Da
 
 
 # =========================
-# UI (lightweight & official)
+# UI
 # =========================
 st.set_page_config(page_title="NTL Detector - CT Meters", layout="wide")
+st.title("NTL Detector – لوحة تحليل الحالات الشاذة (عدادات CT)")
 
-st.title("NTL Detector – شاشة تشغيل كشف الفاقد المحتمل (عدادات CT)")
-
-# Sidebar settings
 st.sidebar.header("إعدادات التشغيل")
-top_percent = st.sidebar.slider("نسبة العدادات الأعلى خطورة (Top %)", 0.1, 10.0, 1.0, 0.1)
+min_case_risk = st.sidebar.slider("حد الشذوذ لإظهار الحالات فقط (Risk >=)", 0, 100, 60, 1)
 
 compute_periods = st.sidebar.checkbox("استخراج فترات عبث (قد يكون أبطأ)", value=True)
 meter_quantile_for_periods = st.sidebar.slider("حساسية تحديد الفترة داخل العداد (Quantile)", 0.80, 0.99, 0.95, 0.01)
 min_period_points = st.sidebar.slider("أقل عدد نقاط لتكوين فترة", 1, 12, 2, 1)
 
 st.sidebar.markdown("---")
-st.sidebar.caption("ملاحظة: إذا الملف كبير جدًا، يمكن إلغاء استخراج الفترات والاكتفاء بأعلى وقت خطورة لكل عداد.")
+st.sidebar.caption("ملاحظة: تم إلغاء Top% بالكامل لتجنب إغفال أي حالة. يتم عرض الحالات الشاذة فقط حسب حد الشذوذ.")
+
 st.subheader("قالب الإدخال")
 st.caption("حمّل القالب، عبّيه بالبيانات المطلوبة، ثم ارفعه هنا للتحليل.")
 
@@ -516,8 +617,8 @@ if template_bytes:
     )
 else:
     st.warning("لم يتم العثور على ملف القالب داخل المشروع. تأكد أنه موجود باسم: Data Template.xlsx")
-uploaded = st.file_uploader("ارفع ملف البيانات (.xlsx)", type=["xlsx"])
 
+uploaded = st.file_uploader("ارفع ملف البيانات (.xlsx)", type=["xlsx"])
 if uploaded is None:
     st.info("ارفع ملف Excel يحتوي الأعمدة: Meter Number, Meter Datetime, Office, V1..V3, A1..A3")
     st.stop()
@@ -527,7 +628,7 @@ try:
         file_bytes = uploaded.getvalue()
         rows_scored, meters_ranked, cases_table, rows_top_export = run_inference(
             file_bytes=file_bytes,
-            top_percent=top_percent,
+            min_case_risk=min_case_risk,
             meter_quantile_for_periods=meter_quantile_for_periods,
             min_period_points=min_period_points,
             compute_periods=compute_periods
@@ -539,40 +640,92 @@ except Exception as e:
 
 # KPIs
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("عدد الصفوف", f"{len(rows_scored):,}")
+c1.metric("عدد الصفوف (Valid)", f"{len(rows_scored):,}")
 c2.metric("عدد العدادات", f"{meters_ranked['Meter Number'].nunique():,}")
 c3.metric("متوسط قراءات/عداد", f"{meters_ranked['n_points'].mean():.1f}")
-c4.metric("عدد الحالات (Cases)", f"{len(cases_table):,}")
+c4.metric("عدد الحالات الشاذة (بعد الفلترة)", f"{len(cases_table):,}")
 
-st.subheader("جدول الحالات الشاذة (Cases) – شامل")
-st.caption("كل صف يمثل حالة: (عداد + فترة/وقت + نسبة احتمال + سبب + وقت زيارة مقترح).")
+tab1, tab2, tab3 = st.tabs(["Cases Explorer (الحالات)", "Meters Explorer (العدادات)", "Meter Profile (ملف العداد)"])
 
-# Filters (light)
-colf1, colf2, colf3 = st.columns([2, 1, 1])
-with colf1:
-    meter_search = st.text_input("بحث برقم العداد (اختياري)", value="")
-with colf2:
-    conf_filter = st.selectbox("فلتر الثقة", ["All", "High", "Medium", "Low"], index=0)
-with colf3:
-    min_risk = st.slider("حد أدنى لنسبة الاحتمال (Risk%)", 0, 100, 60, 5)
+with tab1:
+    st.subheader("جميع الحالات الشاذة (مرتبة من الأقل إلى الأعلى Risk%)")
+    st.caption("الجدول يعرض الحالات الشاذة فقط حسب حد الشذوذ. يمكنك الفرز بأي عمود مباشرة من الجدول.")
 
-filtered = cases_table.copy()
-if meter_search.strip():
-    filtered = filtered[filtered["Meter Number"].astype(str).str.contains(meter_search.strip(), na=False)]
-if conf_filter != "All":
-    filtered = filtered[filtered["confidence"] == conf_filter]
-filtered = filtered[filtered["risk_%"] >= float(min_risk)]
+    # Light filters (user decides sorting)
+    f1, f2, f3 = st.columns([2, 1, 1])
+    with f1:
+        meter_search = st.text_input("بحث برقم العداد (اختياري)", value="")
+    with f2:
+        office_filter = st.selectbox("Office (اختياري)", ["All"] + sorted(cases_table["Office"].dropna().astype(str).unique().tolist()) if len(cases_table) else ["All"])
+    with f3:
+        conf_filter = st.selectbox("Confidence (اختياري)", ["All", "High", "Medium", "Low"], index=0)
 
-st.dataframe(filtered, use_container_width=True)
+    filtered = cases_table.copy()
+    if meter_search.strip():
+        filtered = filtered[filtered["Meter Number"].astype(str).str.contains(meter_search.strip(), na=False)]
+    if office_filter != "All" and len(filtered):
+        filtered = filtered[filtered["Office"].astype(str) == str(office_filter)]
+    if conf_filter != "All" and len(filtered):
+        filtered = filtered[filtered["confidence"] == conf_filter]
 
-# Quick meter ranking (compact)
-st.subheader("ملخص العدادات الأعلى خطورة (Top meters)")
-st.dataframe(meters_ranked.head(50), use_container_width=True)
+    # Show important columns first
+    preferred_cols = [
+        "case_type","Meter Number","Office","risk_%","confidence","reason",
+        "start_time","end_time","duration_min","points","suggested_visit_time",
+        # electrical numeric (instant or period)
+        "V1","V2","V3","A1","A2","A3","V_mean","A_mean","S_proxy",
+        "V1_peak","V2_peak","V3_peak","A1_peak","A2_peak","A3_peak",
+        "V_mean_avg","V_mean_peak","A_mean_avg","A_mean_peak","S_proxy_avg","S_proxy_peak",
+        "V_imb_%","A_imb_%","Amax_Amin_ratio",
+        "risk_point_%","risk_dist_%","risk_temp_%"
+    ]
+    cols = [c for c in preferred_cols if c in filtered.columns] + [c for c in filtered.columns if c not in preferred_cols]
+    st.dataframe(filtered[cols], use_container_width=True)
 
+with tab2:
+    st.subheader("العدادات (للاستكشاف والترتيب)")
+    st.caption("هذا الجدول يعرض جميع العدادات. يمكنك الفرز/البحث حسب risk_max أو n_points أو المكتب.")
+
+    m1, m2 = st.columns([2, 1])
+    with m1:
+        meter_search2 = st.text_input("بحث برقم العداد (اختياري) ", value="", key="meter_search2")
+    with m2:
+        office_filter2 = st.selectbox("Office (اختياري) ", ["All"] + sorted(meters_ranked["Office"].dropna().astype(str).unique().tolist()), index=0)
+
+    mdf = meters_ranked.copy()
+    if meter_search2.strip():
+        mdf = mdf[mdf["Meter Number"].astype(str).str.contains(meter_search2.strip(), na=False)]
+    if office_filter2 != "All":
+        mdf = mdf[mdf["Office"].astype(str) == str(office_filter2)]
+
+    st.dataframe(mdf, use_container_width=True)
+
+with tab3:
+    st.subheader("Meter Profile – ملف العداد (بدون رسوم، أرقام فقط)")
+    meter_list = meters_ranked["Meter Number"].astype(str).tolist()
+    chosen = st.selectbox("اختر العداد", meter_list, index=0)
+
+    mrow = meters_ranked[meters_ranked["Meter Number"].astype(str) == chosen].iloc[0]
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Risk Max", f"{mrow['risk_max']:.2f}%")
+    k2.metric("Risk Mean", f"{mrow['risk_mean']:.2f}%")
+    k3.metric("عدد القراءات", f"{int(mrow['n_points'])}")
+    k4.metric("Office", str(mrow["Office"]))
+
+    st.markdown("### الحالات الشاذة لهذا العداد")
+    meter_cases = cases_table[cases_table["Meter Number"].astype(str) == chosen].copy()
+    st.dataframe(meter_cases, use_container_width=True)
+
+    st.markdown("### أعلى 15 قراءة (حسب final_score) لهذا العداد")
+    meter_rows = rows_scored[rows_scored["Meter Number"].astype(str) == chosen].copy()
+    top15 = meter_rows.sort_values("final_score", ascending=False).head(15)[
+        ["Meter Datetime","final_score","V1","V2","V3","A1","A2","A3","n_p_if","n_d_if","n_t_if"]
+    ]
+    st.dataframe(top15, use_container_width=True)
 
 # Export
-st.subheader("تصدير النتائج")
-excel_bytes = build_excel_bytes(filtered, meters_ranked, rows_top_export)
+st.subheader("تصدير النتائج (Excel)")
+excel_bytes = build_excel_bytes(cases_table, meters_ranked, rows_top_export)
 st.download_button(
     label="تحميل النتائج كملف Excel",
     data=excel_bytes,
@@ -580,9 +733,5 @@ st.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-st.caption("Sheets داخل ملف Excel: Cases (الحالات) + Meters (ترتيب العدادات) + TopRows (أعلى قراءات خطورة - مختصرة).")
-if uploaded is None:
-    st.info("ارفع ملف Excel يحتوي الأعمدة: Meter Number, Meter Datetime, Office, V1..V3, A1..A3")
-
-    st.markdown("---")
-st.markdown("👨‍💻 Developed by: Mashhour Alabbas 0553339838 | 2026")
+st.caption("Sheets داخل ملف Excel: Cases (الحالات الشاذة فقط) + Meters (كل العدادات) + TopRows (أعلى صفوف شذوذ ضمن حد الشذوذ).")
+st.markdown("👨‍💻 Developed by: Mashhour Alabbas | 2026")
